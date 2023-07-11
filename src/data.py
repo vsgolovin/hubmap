@@ -46,17 +46,18 @@ class DetectionDataset1(torch.utils.data.Dataset):
                 mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
                                     pts=[coords], color=1)
                 img_masks.append(mask)
-            self.ids.append(img_id)
-            self.masks.append(np.array(img_masks))
+            if img_masks:
+                self.ids.append(img_id)
+                self.masks.append(img_masks)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, idx: int) -> tuple:
         p = self._get_img_path(self.ids[idx])
         img = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_RGB2BGR)
         masks = self.masks[idx]
         if self.transform:
             out = self.transform(image=img, masks=masks)
             img = out["image"]
-            masks = np.array(out["masks"])
+            masks = out["masks"]
         return img, masks
 
     def __len__(self) -> int:
