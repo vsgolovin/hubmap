@@ -4,9 +4,10 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import Dataset, Subset
 
 
-class DetectionDataset1(torch.utils.data.Dataset):
+class DetectionDataset(torch.utils.data.Dataset):
     "Detections from dataset 1"
     def __init__(self, root: Path | str, transform: Callable | None):
         self.root = Path(root)
@@ -65,3 +66,22 @@ class DetectionDataset1(torch.utils.data.Dataset):
 
     def _get_img_path(self, img_id: str) -> Path:
         return self.img_dir / f"{img_id}.tif"
+
+
+class DetectionSubset(Dataset):
+    def __init__(self, dset: DetectionDataset, indices: np.ndarray,
+                 transform: Callable | None):
+        assert dset.transform is None or transform is None
+        self.dset = Subset(dset, indices=indices)
+        self.transform = transform
+
+    def __getitem__(self, idx):
+        image, masks = self.dset[idx]
+        if self.transform is not None:
+            out = self.transform(image=image, masks=masks)
+            image = out["image"]
+            masks = out["masks"]
+        return image, masks
+
+    def __len__(self) -> int:
+        return len(self.dset)
