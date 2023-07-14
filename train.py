@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -14,6 +15,8 @@ from src import utils
 
 import click
 
+MODEL_DIR = Path("models")
+
 
 @click.command(context_settings={"show_default": True})
 @click.option("--seed", type=int, default=5511)
@@ -22,8 +25,9 @@ import click
 @click.option("--epochs", type=int, default=12)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=3)
+@click.option("-w", "--backbone-weights", type=str, default="default")
 def main(seed: int, split_seed: int, lr: float, epochs: int,
-         trainable_bb_layers: int):
+         trainable_bb_layers: int, backbone_weights: str):
     pl.seed_everything(seed)
 
     # datasets and dataloaders
@@ -40,6 +44,11 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     # create and train the model
     model = LitMaskRCNN(lr=lr, pretrained=True,
                         trainable_backbone_layers=trainable_bb_layers)
+    if backbone_weights != "default":
+        model.model.backbone.body.load_state_dict(
+            torch.load(MODEL_DIR / f"{backbone_weights}.pth"),
+            strict=False
+        )
     save_best = ModelCheckpoint(monitor="val_loss/total", mode="min")
     trainer = pl.Trainer(
         accelerator="gpu",
@@ -54,7 +63,7 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
     trainer.test(model, val_dl)
     # export state dict
-    torch.save(model.model.state_dict(), "models/mask_r-cnn.pth")
+    torch.save(model.model.state_dict(), MODEL_DIR / "mask_r-cnn.pth")
 
 
 def get_transform(train: bool = True):
