@@ -3,8 +3,11 @@ from typing import Callable
 import cv2
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 import torch
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms as T
+import pytorch_lightning as pl
 
 
 class DetectionDataset(torch.utils.data.Dataset):
@@ -85,3 +88,77 @@ class DetectionSubset(Dataset):
 
     def __len__(self) -> int:
         return len(self.dset)
+
+
+class ImageDenoisingDataset(Dataset):
+    "Images for unsupervised or self-supervised learning"
+    def __init__(self, root: Path | str, image_ids: list[str],
+                 aug_transform: Callable, noise_transform: Callable):
+        "Both transforms should have albumentations interface"
+        self.root = Path(root)
+        assert self.root.exists() and self.root.is_dir()
+        self.image_ids = tuple(image_ids)
+        self.aug_transform = aug_transform
+        self.noise_transform = noise_transform
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+        self.to_tensor = T.ToTensor()
+
+    def __getitem__(self, idx) -> tuple[np.ndarray, np.ndarray]:
+        path = self.root / f"{self.image_ids[idx]}.tif"
+        image = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+        image = self.aug_transform(image=image)["image"]
+        noisy_image = self.noise_transform(image=image)["image"]
+        image = self.to_tensor(image)
+        noisy_image = self.normalize(self.to_tensor(noisy_image))
+        return noisy_image, image
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+
+class DenoisingDataModule(pl.LightningDataModule):
+    def __init__(self, root: Path | str, aug_transform: Callable,
+                 noise_transform: Callable, split_seed: int | None = None,
+                 test_size: float = 0.1, batch_size: int = 16,
+                 num_workers: int = 4):
+        super().__init__()
+        self.root = Path(root)
+        assert self.root.exists() and self.root.is_dir()
+        self.aug_transform = aug_transform
+        self.noise_transform = noise_transform
+        self.split_seed = split_seed
+        self.test_size = test_size
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def prepare_data(self):
+        self.tile_meta = pd.read_csv(self.root / "tile_meta.csv")
+
+    def setup(self, stage: str):
+        mask = self.tile_meta["dataset"] == 3
+        img_ids = self.tile_meta.loc[mask, "id"].to_list()
+        wsi = self.tile_meta.loc[mask, "source_wsi"].to_numpy()
+        train_ids, val_ids = train_test_split(
+            img_ids, test_size=self.test_size, random_state=self.split_seed,
+            stratify=wsi)
+        self.train_dset = ImageDenoisingDataset(
+            root=self.root / "train",
+            image_ids=train_ids,
+            aug_transform=self.aug_transform,
+            noise_transform=self.noise_transform
+        )
+        self.val_dset = ImageDenoisingDataset(
+            root=self.root / "train",
+            image_ids=val_ids,
+            aug_transform=self.aug_transform,
+            noise_transform=self.noise_transform
+        )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dset, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dset, batch_size=self.batch_size,
+                          shuffle=False, num_workers=self.num_workers)
