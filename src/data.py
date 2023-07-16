@@ -6,7 +6,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import transforms as T
+from torchvision.transforms.functional import to_tensor
 import pytorch_lightning as pl
 
 
@@ -100,18 +100,13 @@ class ImageDenoisingDataset(Dataset):
         self.image_ids = tuple(image_ids)
         self.aug_transform = aug_transform
         self.noise_transform = noise_transform
-        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-        self.to_tensor = T.ToTensor()
 
     def __getitem__(self, idx) -> tuple[np.ndarray, np.ndarray]:
         path = self.root / f"{self.image_ids[idx]}.tif"
         image = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
         image = self.aug_transform(image=image)["image"]
         noisy_image = self.noise_transform(image=image)["image"]
-        image = self.to_tensor(image)
-        noisy_image = self.normalize(self.to_tensor(noisy_image))
-        return noisy_image, image
+        return to_tensor(noisy_image), to_tensor(image)
 
     def __len__(self) -> int:
         return len(self.image_ids)

@@ -3,6 +3,7 @@ from torchvision import models
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.transforms import Normalize
 
 
 def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
@@ -71,16 +72,15 @@ class ResNetFeatures(nn.Module):
 class ResNet50AutoEncoder(nn.Module):
     def __init__(self, pretrained: bool = True,
                  trainable_backbone_layers: int = 3,
-                 latent_size: int = 512):
+                 dropout: float | None = None):
         super().__init__()
+        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
         self.encoder = ResNetFeatures(50, pretrained=pretrained)
         self.encoder.set_n_trainable_layers(trainable_backbone_layers)
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(2048, latent_size, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(latent_size, 2048, kernel_size=1),
-            nn.GELU()
-        )
+        # optionally drop random final feature map channels
+        assert dropout is None or 0.0 <= dropout < 1.0
+        self.dropout = nn.Dropout2d(p=dropout) if dropout else nn.Identity()
         self.decoder = nn.ModuleList([
             self._dec_block(2048, 1024),
             self._dec_block(1024, 512),
@@ -91,8 +91,10 @@ class ResNet50AutoEncoder(nn.Module):
         ])
 
     def forward(self, x: Tensor) -> Tensor:
+        "Input shold be in [0, 1] range"
+        x = self.normalize(x)
         x = self.encoder(x)
-        x = self.bottleneck(x)
+        x = self.dropout(x)  # identity by default
         for module in self.decoder:
             x = module(x)
         return x
@@ -100,11 +102,11 @@ class ResNet50AutoEncoder(nn.Module):
     @staticmethod
     def _dec_block(c_in: int, c_out: int) -> nn.Module:
         return nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(c_in, c_out, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(c_out),
+            nn.PixelShuffle(upscale_factor=2),
+            nn.Conv2d(c_in // 4, c_in // 4, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(c_in // 4),
             nn.GELU(),
-            nn.Conv2d(c_out, c_out, 3, 1, 1, bias=False),
+            nn.Conv2d(c_in // 4, c_out, 1, 1, 0, bias=False),
             nn.BatchNorm2d(c_out),
             nn.GELU()
         )
