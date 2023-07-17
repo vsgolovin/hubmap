@@ -3,7 +3,6 @@ from torchvision import models
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-from torchvision.transforms import Normalize
 
 
 def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
@@ -79,8 +78,6 @@ class ResNet50AutoEncoder(nn.Module):
                  trainable_backbone_layers: int = 3,
                  dropout: float | None = None):
         super().__init__()
-        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225])
         self.encoder = ResNetFeatures(50, pretrained=pretrained)
         self.encoder.set_n_trainable_layers(trainable_backbone_layers)
         # optionally drop random final feature map channels
@@ -97,7 +94,6 @@ class ResNet50AutoEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         "Input shold be in [0, 1] range"
-        x = self.normalize(x)
         x = self.encoder(x)
         x = self.dropout(x)  # identity by default
         for module in self.decoder:

@@ -90,38 +90,39 @@ class DetectionSubset(Dataset):
         return len(self.dset)
 
 
-class ImageDenoisingDataset(Dataset):
+class ImageDataset(Dataset):
     "Images for unsupervised or self-supervised learning"
     def __init__(self, root: Path | str, image_ids: list[str],
-                 aug_transform: Callable, noise_transform: Callable):
-        "Both transforms should have albumentations interface"
+                 transform: Callable):
+        "`transform` should have `albumentations` interface"
         self.root = Path(root)
         assert self.root.exists() and self.root.is_dir()
         self.image_ids = tuple(image_ids)
-        self.aug_transform = aug_transform
-        self.noise_transform = noise_transform
+        self.transform = transform
 
     def __getitem__(self, idx) -> tuple[np.ndarray, np.ndarray]:
         path = self.root / f"{self.image_ids[idx]}.tif"
         image = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
-        image = self.aug_transform(image=image)["image"]
-        noisy_image = self.noise_transform(image=image)["image"]
-        return to_tensor(noisy_image), to_tensor(image)
+        image = self.transform(image=image)["image"]
+        if not isinstance(image, torch.Tensor):
+            image = to_tensor(image)
+        return image
 
     def __len__(self) -> int:
         return len(self.image_ids)
 
 
-class DenoisingDataModule(pl.LightningDataModule):
-    def __init__(self, root: Path | str, aug_transform: Callable,
-                 noise_transform: Callable, split_seed: int | None = None,
+class ImageDataModule(pl.LightningDataModule):
+    "Datamodule for self-supervised learning, returns only uncorrupted images"
+    def __init__(self, root: Path | str, train_transform: Callable,
+                 val_transform: Callable, split_seed: int | None = None,
                  test_size: float = 0.1, batch_size: int = 16,
                  num_workers: int = 4):
         super().__init__()
         self.root = Path(root)
         assert self.root.exists() and self.root.is_dir()
-        self.aug_transform = aug_transform
-        self.noise_transform = noise_transform
+        self.train_transform = train_transform
+        self.val_transform = val_transform
         self.split_seed = split_seed
         self.test_size = test_size
         self.batch_size = batch_size
@@ -137,17 +138,15 @@ class DenoisingDataModule(pl.LightningDataModule):
         train_ids, val_ids = train_test_split(
             img_ids, test_size=self.test_size, random_state=self.split_seed,
             stratify=wsi)
-        self.train_dset = ImageDenoisingDataset(
+        self.train_dset = ImageDataset(
             root=self.root / "train",
             image_ids=train_ids,
-            aug_transform=self.aug_transform,
-            noise_transform=self.noise_transform
+            transform=self.train_transform
         )
-        self.val_dset = ImageDenoisingDataset(
+        self.val_dset = ImageDataset(
             root=self.root / "train",
             image_ids=val_ids,
-            aug_transform=self.aug_transform,
-            noise_transform=self.noise_transform
+            transform=self.val_transform
         )
 
     def train_dataloader(self):
