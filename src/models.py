@@ -10,11 +10,16 @@ def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
                  num_classes: int = 2, predictor_hidden_size: int = 256):
     # load model
     weights = "COCO_V1" if pretrained else None
+    model = maskrcnn_resnet50_fpn(weights=weights)
+
+    # freeze backbone layers
     assert 0 <= trainable_backbone_layers <= 5
-    model = maskrcnn_resnet50_fpn(
-        weights=weights,
-        trainable_backbone_layers=trainable_backbone_layers
-    )
+    layers_to_train = ["layer4", "layer3", "layer2", "layer1", "conv1"
+                       ][:trainable_backbone_layers]
+    for name, parameter in model.backbone.body.named_parameters():
+        if not any(name.startswith(prefix) for prefix in layers_to_train):
+            parameter.requires_grad_(False)
+
     # replace heads
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
