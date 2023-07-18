@@ -36,10 +36,10 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
                                           random_state=split_seed)
     train_ds = DetectionSubset(dset, train_idx, get_transform(train=True))
     val_ds = DetectionSubset(dset, val_idx, get_transform(train=False))
-    train_dl = DataLoader(train_ds, 1, shuffle=True, collate_fn=collate_fn,
-                          num_workers=1)
-    val_dl = DataLoader(val_ds, 1, shuffle=False, collate_fn=collate_fn,
-                        num_workers=1)
+    train_dl = DataLoader(train_ds, 2, shuffle=True, collate_fn=collate_fn,
+                          num_workers=2)
+    val_dl = DataLoader(val_ds, 2, shuffle=False, collate_fn=collate_fn,
+                        num_workers=2)
 
     # create and train the model
     model = LitMaskRCNN(lr=lr, pretrained=True,
@@ -55,7 +55,7 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     trainer = pl.Trainer(
         accelerator="gpu",
         max_epochs=epochs,
-        accumulate_grad_batches=16,
+        accumulate_grad_batches=8,
         log_every_n_steps=8,
         callbacks=[save_best],
         logger=logger

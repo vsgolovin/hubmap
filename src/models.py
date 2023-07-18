@@ -1,8 +1,13 @@
-from torch import Tensor, nn
+import pytorch_lightning as pl
+import torch
+from torch import nn, optim, Tensor
+from torch.nn.functional import interpolate
 from torchvision import models
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.transforms import Normalize
+from torchvision.utils import make_grid
 
 
 def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
@@ -111,3 +116,113 @@ class ResNet50AutoEncoder(nn.Module):
             nn.BatchNorm2d(c_out),
             nn.GELU()
         )
+
+
+class MaskedAutoEncoder(pl.LightningModule):
+    def __init__(self, masking_ratio: float, mask_patch_size: int = 32,
+                 learning_rate: float = 1e3, weight_decay: float = 0.0,
+                 pretrained: bool = True,
+                 trainable_backbone_layers: int = 3):
+        super().__init__()
+        self.lr = learning_rate
+        self.wd = weight_decay
+        self.mratio = masking_ratio
+        self.mask_xy = mask_patch_size
+        self.save_hyperparameters()
+
+        # network architecture
+        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+        self.encoder = ResNetFeatures(50, pretrained=pretrained)
+        self.set_trainable_backbone_layers(trainable_backbone_layers)
+        self.mask_token = nn.Parameter(torch.zeros((1, 2048, 1, 1)))
+        self.decoder = nn.ModuleList([
+            self._dec_block(2048, 1024),
+            self._dec_block(1024, 512),
+            self._dec_block(512, 256),
+            self._dec_block(256, 128),
+            self._dec_block(128, 64),
+            nn.Conv2d(64, 3, 1, 1)
+        ])
+        self.mask = None  # placeholder to share mask during forward pass
+
+    @staticmethod
+    def _dec_block(c_in: int, c_out: int) -> nn.Module:
+        return nn.Sequential(
+            nn.PixelShuffle(upscale_factor=2),
+            nn.Conv2d(c_in // 4, c_in // 4, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(c_in // 4),
+            nn.GELU(),
+            nn.Conv2d(c_in // 4, c_out, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.GELU()
+        )
+
+    def _create_mask(self, b: int, h: int, w: int) -> Tensor:
+        # randomly select masking regions
+        assert h % self.mask_xy == 0 and w % self.mask_xy == 0
+        hm, wm = h // self.mask_xy, w // self.mask_xy
+        # number of masked squares
+        n = int(round(self.mratio * hm * wm))
+        # indices of masked squares for every image
+        inds = torch.rand((b, hm * wm)).argsort(1)[:, :n]
+        # convert indices to boolean mask
+        mask = torch.ones((b, hm * wm), dtype=torch.float32)
+        mask[torch.arange(b).repeat_interleave(n), inds.ravel()] = 0.0
+        # reshape and upscale mask
+        mask = mask.reshape((b, 1, hm, wm))
+        mask = interpolate(mask, size=(h, w), mode="nearest")
+        self.mask = mask.repeat((1, 3, 1, 1)).to(self.device)
+
+    def set_trainable_backbone_layers(self, n: int):
+        self.encoder.set_n_trainable_layers(n)
+
+    def _encode(self, x: Tensor) -> Tensor:
+        x = self.normalize(x)
+        x = self.encoder(x)
+        mtoken = self.mask_token.repeat((x.size(0), 1, x.size(2), x.size(3)))
+        mask = self.mask[:, 0:1, ::self.mask_xy, ::self.mask_xy]
+        return x * mask + mtoken * (1 - mask)
+
+    def _decode(self, x: Tensor) -> Tensor:
+        for module in self.decoder.children():
+            x = module(x)
+        return x
+
+    def forward(self, x: Tensor):
+        b, _, h, w = x.shape
+        self._create_mask(b, h, w)  # creates self.mask
+        y = self._encode(x)
+        return self._decode(y)
+
+    def training_step(self, batch, batch_idx):
+        input = batch
+        pred = self.forward(input)
+        mask = 1 - self.mask
+        loss = (mask * (pred - input)**2).sum() / mask.sum()
+        self.log("train_loss", loss, prog_bar=True)
+        self.mask = None  # delete just in case
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        # compute loss
+        input = batch
+        pred = self.forward(input)
+        mask = 1 - self.mask
+        loss = (mask * (pred - input)**2).sum() / mask.sum()
+        self.log("val_loss", loss, prog_bar=True)
+        # log images
+        if batch_idx == 0:
+            img_stack = torch.cat(
+                [input, input * self.mask, pred.clip(0, 1),
+                 (input * self.mask + pred * (1 - self.mask)).clip(0, 1)],
+                dim=0
+            )
+            grid = make_grid(img_stack, nrow=len(input))
+            self.logger.experiment.add_image("outputs", grid,
+                                             self.current_epoch)
+        # delete mask
+        self.mask = None
+
+    def configure_optimizers(self):
+        return optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)

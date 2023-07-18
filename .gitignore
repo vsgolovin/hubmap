@@ -1,6 +1,6 @@
 data
 lightning_logs/
-models/*.pth
+models/**/*.pth
 submission.csv
 
 # Byte-compiled / optimized / DLL files
