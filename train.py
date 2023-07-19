@@ -29,7 +29,7 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     dm = DetectionDataModule(
         root="./data",
         target_class="blood_vessel",
-        dataset_ids=[2],
+        dataset_ids=[1],
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
         split_seed=split_seed,
@@ -52,7 +52,7 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
         accelerator="gpu",
         max_epochs=epochs,
         accumulate_grad_batches=8,
-        log_every_n_steps=8,
+        log_every_n_steps=16,
         callbacks=[save_best],
         logger=logger,
     )
@@ -88,7 +88,7 @@ class LitMaskRCNN(pl.LightningModule):
     def __init__(self, lr: float = 3e-4, **kwargs):
         super().__init__()
         self.lr = lr
-        self.model = get_maskrcnn(num_classes=3, **kwargs)
+        self.model = get_maskrcnn(num_classes=2, **kwargs)
         self.test_preds = []
         self.test_targets = []
         self.save_hyperparameters()
