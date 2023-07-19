@@ -8,8 +8,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from src.data import DetectionDataModule
 from src.models import get_maskrcnn
 
-from pytorch_lightning.profilers import AdvancedProfiler
-
 import click
 
 MODEL_DIR = Path("models")
@@ -30,12 +28,11 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     # datasets and dataloaders
     dm = DetectionDataModule(
         root="./data",
-        dataset_id=2,
+        target_class="blood_vessel",
+        dataset_ids=[2],
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
-        drop_unsure=True,
         split_seed=split_seed,
-        stratify_policy="glomerulus",
         batch_size=2,
         num_workers=2
     )
@@ -51,7 +48,6 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     save_best = ModelCheckpoint(monitor="val_loss/total", mode="min")
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="detection")
-    profiler = AdvancedProfiler(dirpath=".", filename="perf_logs")
     trainer = pl.Trainer(
         accelerator="gpu",
         max_epochs=epochs,
@@ -59,7 +55,6 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
         log_every_n_steps=8,
         callbacks=[save_best],
         logger=logger,
-        profiler=profiler,
     )
     trainer.fit(model, dm)
 

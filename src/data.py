@@ -15,66 +15,24 @@ from src import utils
 CLASS_NAMES = ("blood_vessel", "glomerulus", "unsure")
 
 
-class AnnotatedImage:
-    def __init__(self, path: Path | str, annotations: list):
-        self.path = Path(path)
-        assert self.path.exists()
-        self.id = self.path.stem
-        # parse annotations
-        self.masks = dict.fromkeys(CLASS_NAMES, [])
-        for d in annotations:
-            # convert polygon coordinates to mask
-            coords = np.array(d["coordinates"][0])
-            mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
-                                pts=[coords], color=1)
-            # append mask to apropriate list
-            label = d["type"]
-            self.masks[label].append(mask)
-        assert len(self.masks.keys()) == len(CLASS_NAMES)
-
-    def __str__(self):
-        return self.id
-
-    @property
-    def object_counts(self) -> dict:
-        "Dictionary with number of detections for each class"
-        return {k: len(lst) for k, lst in self.masks.items()}
-
-    @property
-    def total_objects(self) -> int:
-        "Total number of detected objects"
-        return sum(len(lst) for lst in self.masks.values())
-
-    @property
-    def has_glomerulus(self) -> bool:
-        return len(self.masks["glomerulus"]) > 0
-
-    def get(self, drop_unsure: bool = False):
-        image = cv2.imread(str(self.path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        masks = []
-        labels = []
-        cls_names = CLASS_NAMES[:-1] if drop_unsure else CLASS_NAMES
-        for i, label in enumerate(cls_names):
-            masks.extend(self.masks[label])
-            labels.extend([i + 1] * len(self.masks[label]))
-        return image, masks, labels
-
-
 class DetectionDataset(Dataset):
-    def __init__(self, images: list[AnnotatedImage],
-                 transform: Callable | None, drop_unsure: bool = False):
+    def __init__(self, root: Path, images: list[str], masks: list[np.ndarray],
+                 transform: Callable | None):
+        self.root = root
         self.images = images
+        self.masks = masks
         self.transform = transform
-        self.drop_unsure = drop_unsure
 
     def __getitem__(self, idx):
-        image, masks, labels = self.images[idx].get(self.drop_unsure)
+        image_path = self.root / f"{self.images[idx]}.tif"
+        image = cv2.imread(str(image_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        masks = self.masks[idx]
         if self.transform:
             out = self.transform(image=image, masks=masks)
             image = out["image"]
             masks = out["masks"]
-        return image, masks, labels
+        return image, masks
 
     def __len__(self) -> int:
         return len(self.images)
@@ -82,24 +40,22 @@ class DetectionDataset(Dataset):
 
 class DetectionDataModule(pl.LightningDataModule):
     "Uses images either from dataset 1 or dataset 2"
-    def __init__(self, root: Path | str, dataset_id: int,
-                 train_transform: Callable, val_transform: Callable,
-                 drop_unsure: bool = True, split_seed: int | None = None,
-                 val_size: float = 0.1, stratify_policy: str | None = "wsi",
-                 batch_size: int = 2, num_workers: int = 2):
+    def __init__(self, root: Path | str, target_class: str,
+                 dataset_ids: list[int], train_transform: Callable,
+                 val_transform: Callable, split_seed: int | None = None,
+                 val_size: float = 0.1, batch_size: int = 2,
+                 num_workers: int = 2):
         super().__init__()
         self.root = Path(root)
         assert self.root.exists() and self.root.is_dir()
-        assert dataset_id in [1, 2]
-        self.dataset_id = dataset_id
+        assert target_class in CLASS_NAMES[:-1]
+        self.target_class = target_class
+        assert set(dataset_ids).issubset({1, 2})
+        self.dataset_ids = dataset_ids
         self.train_transform = train_transform
         self.val_transform = val_transform
-        self.drop_unsure = drop_unsure
         self.split_seed = split_seed
         self.val_size = val_size
-        assert (stratify_policy is None
-                or stratify_policy in ["wsi", "glomerulus"])
-        self.stratify_policy = stratify_policy
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -110,27 +66,32 @@ class DetectionDataModule(pl.LightningDataModule):
         # read polygons.jsonl -- file with object masks
         polygons = pd.read_json(self.root / "polygons.jsonl", lines=True)
         self.images = []
+        self.masks = []
         for _, row in polygons.iterrows():
             img_id = row["id"]
             # skip images from other dataset
-            if df.loc[img_id, "dataset"] != self.dataset_id:
+            if df.loc[img_id, "dataset"] not in self.dataset_ids:
                 continue
-            fname = self.root / "train" / f"{img_id}.tif"
-            image = AnnotatedImage(fname, row["annotations"])
-            if self.drop_unsure:
-                # drop images with only objects of class "unsure"
-                if image.object_counts["unsure"] == image.total_objects:
+            # read masks
+            masks = []
+            for d in row["annotations"]:
+                if d["type"] != self.target_class:
                     continue
-            self.images.append(image)
+                # convert polygon coordinates to mask
+                coords = np.array(d["coordinates"][0])
+                mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
+                                    pts=[coords], color=1)
+                masks.append(mask)
+            # image has objects of target class
+            if len(masks) > 0:
+                self.images.append(img_id)
+                self.masks.append(np.array(masks))
 
     def setup(self, stage: str):
-        if self.stratify_policy == "glomerulus":
-            stratify = [img.has_glomerulus for img in self.images]
-        elif self.stratify_policy == "wsi":
-            df = pd.read_csv(self.root / "tile_meta.csv").set_index("id")
-            stratify = [df.loc[img.id, "source_wsi"] for img in self.images]
-        else:
-            stratify = None
+        # stratify by WSI
+        df = pd.read_csv(self.root / "tile_meta.csv").set_index("id")
+        stratify = [df.loc[img_id, "source_wsi"] for img_id in self.images]
+        # split data
         train_idx, val_idx = train_test_split(
             np.arange(len(self.images)),
             test_size=self.val_size,
@@ -138,25 +99,27 @@ class DetectionDataModule(pl.LightningDataModule):
             stratify=stratify
         )
         self.train_dset = DetectionDataset(
+            root=self.root / "train",
             images=[self.images[ind] for ind in train_idx],
-            transform=self.train_transform,
-            drop_unsure=self.drop_unsure
+            masks=[self.masks[ind] for ind in train_idx],
+            transform=self.train_transform
         )
         self.val_dset = DetectionDataset(
+            root=self.root / "train",
             images=[self.images[ind] for ind in val_idx],
-            transform=self.val_transform,
-            drop_unsure=self.drop_unsure
+            masks=[self.masks[ind] for ind in val_idx],
+            transform=self.val_transform
         )
 
     @staticmethod
     def collate_fn(samples: list) -> tuple[list[Tensor], list[dict]]:
         images, targets = [], []
-        for image, masks, labels in samples:
+        for image, masks in samples:
             images.append(image)
             masks = torch.stack(masks)
             boxes = [utils.mask2bbox(mask) for mask in masks]
             boxes = torch.tensor(np.array(boxes), dtype=torch.float32)
-            labels = torch.tensor(np.array(labels, dtype=np.int64))
+            labels = torch.ones(size=(len(masks),), dtype=torch.int64)
             d = {"masks": masks, "boxes": boxes, "labels": labels}
             targets.append(d)
         return images, targets
