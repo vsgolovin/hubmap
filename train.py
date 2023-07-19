@@ -1,17 +1,14 @@
 from pathlib import Path
-import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from sklearn.model_selection import train_test_split
 import torch
-from torch import optim, Tensor
-from torch.utils.data import DataLoader
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from src.data import DetectionDataset, DetectionSubset
+from src.data import DetectionDataModule
 from src.models import get_maskrcnn
-from src import utils
+
+from pytorch_lightning.profilers import AdvancedProfiler
 
 import click
 
@@ -31,15 +28,17 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     pl.seed_everything(seed)
 
     # datasets and dataloaders
-    dset = DetectionDataset("./data", transform=None)
-    train_idx, val_idx = train_test_split(np.arange(len(dset)), test_size=0.1,
-                                          random_state=split_seed)
-    train_ds = DetectionSubset(dset, train_idx, get_transform(train=True))
-    val_ds = DetectionSubset(dset, val_idx, get_transform(train=False))
-    train_dl = DataLoader(train_ds, 2, shuffle=True, collate_fn=collate_fn,
-                          num_workers=2)
-    val_dl = DataLoader(val_ds, 2, shuffle=False, collate_fn=collate_fn,
-                        num_workers=2)
+    dm = DetectionDataModule(
+        root="./data",
+        dataset_id=2,
+        train_transform=get_transform(train=True),
+        val_transform=get_transform(train=False),
+        drop_unsure=True,
+        split_seed=split_seed,
+        stratify_policy="glomerulus",
+        batch_size=2,
+        num_workers=2
+    )
 
     # create and train the model
     model = LitMaskRCNN(lr=lr, pretrained=True,
@@ -52,19 +51,21 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
     save_best = ModelCheckpoint(monitor="val_loss/total", mode="min")
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="detection")
+    profiler = AdvancedProfiler(dirpath=".", filename="perf_logs")
     trainer = pl.Trainer(
         accelerator="gpu",
         max_epochs=epochs,
         accumulate_grad_batches=8,
         log_every_n_steps=8,
         callbacks=[save_best],
-        logger=logger
+        logger=logger,
+        profiler=profiler,
     )
-    trainer.fit(model, train_dl, val_dl)
+    trainer.fit(model, dm)
 
     # compute mean average precision on test (== val)
     model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
-    trainer.test(model, val_dl)
+    trainer.test(model, dm.val_dataloader())
     # export state dict
     torch.save(model.model.state_dict(), MODEL_DIR / "mask_r-cnn.pth")
 
@@ -86,26 +87,13 @@ def get_transform(train: bool = True):
     return A.Compose(transforms)
 
 
-def collate_fn(samples: list) -> tuple[list[Tensor], list[dict]]:
-    images, targets = [], []
-    for image, masks in samples:
-        images.append(image)
-        masks = torch.stack(masks)
-        boxes = [utils.mask2bbox(mask) for mask in masks]
-        boxes = torch.tensor(np.array(boxes), dtype=torch.float32)
-        labels = torch.ones(len(masks), dtype=torch.int64)
-        d = {"masks": masks, "boxes": boxes, "labels": labels}
-        targets.append(d)
-    return images, targets
-
-
 class LitMaskRCNN(pl.LightningModule):
     LOSS_NAMES = ("classifier", "box_reg", "mask", "objectness", "rpn_box_reg")
 
     def __init__(self, lr: float = 3e-4, **kwargs):
         super().__init__()
         self.lr = lr
-        self.model = get_maskrcnn(**kwargs)
+        self.model = get_maskrcnn(num_classes=3, **kwargs)
         self.test_preds = []
         self.test_targets = []
         self.save_hyperparameters()
@@ -116,7 +104,7 @@ class LitMaskRCNN(pl.LightningModule):
         return self.model(images)
 
     def configure_optimizers(self):
-        return optim.Adam(self.model.parameters(), lr=self.lr)
+        return torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
     def training_step(self, batch, batch_idx):
         batch_size = len(batch[0])
