@@ -15,6 +15,43 @@ from src import utils
 CLASS_NAMES = ("blood_vessel", "glomerulus", "unsure")
 
 
+def parse_annotations(annotations: list[dict], class_names: tuple[str],
+                      duplicate_thresh: float = 0.9) -> dict:
+    "Also removes duplicates"
+    out = dict.fromkeys(class_names, [])
+
+    # iterate over target classes
+    for cls_name in class_names:
+
+        # transform polygons to masks
+        masks = []
+        for dct in annotations:
+            if dct["type"] != cls_name:
+                continue
+            # convert polygon coordinates to mask
+            coords = np.array(dct["coordinates"][0])
+            mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
+                                pts=[coords], color=1)
+            masks.append(mask)
+
+        # remove duplicate or strongly overlapping masks
+        masks = np.array(masks)
+        if len(masks) > 1:
+            seen = masks[0].astype(bool)
+            keep = [0]
+            for j, mask in enumerate(masks[1:]):
+                mb = mask.astype(bool)
+                if (mb & seen).sum() / mb.sum() < duplicate_thresh:
+                    keep.append(j + 1)
+                    seen |= mb
+            masks = masks[keep]
+
+        # add masks to dictionary
+        out[cls_name] = masks
+
+    return out
+
+
 class DetectionDataset(Dataset):
     def __init__(self, root: Path, images: list[str], masks: list[np.ndarray],
                  transform: Callable | None):
@@ -73,16 +110,9 @@ class DetectionDataModule(pl.LightningDataModule):
             if df.loc[img_id, "dataset"] not in self.dataset_ids:
                 continue
             # read masks
-            masks = []
-            for d in row["annotations"]:
-                if d["type"] != self.target_class:
-                    continue
-                # convert polygon coordinates to mask
-                coords = np.array(d["coordinates"][0])
-                mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
-                                    pts=[coords], color=1)
-                masks.append(mask)
-            # image has objects of target class
+            masks_dict = parse_annotations(row["annotations"],
+                                           class_names=(self.target_class,))
+            masks = masks_dict[self.target_class]
             if len(masks) > 0:
                 self.images.append(img_id)
                 self.masks.append(np.array(masks))
