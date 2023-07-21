@@ -76,7 +76,6 @@ class DetectionDataset(Dataset):
 
 
 class DetectionDataModule(pl.LightningDataModule):
-    "Uses images either from dataset 1 or dataset 2"
     def __init__(self, root: Path | str, target_class: str,
                  dataset_ids: list[int], train_transform: Callable,
                  val_transform: Callable, split_seed: int | None = None,
@@ -97,7 +96,7 @@ class DetectionDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
     def prepare_data(self):
-        # read tile meta data to select only images from dataset 1
+        # read tile meta to get dataset numbers and WSI
         df = pd.read_csv(self.root / "tile_meta.csv")
         df = df.set_index("id")  # set id as key
         # read polygons.jsonl -- file with object masks
@@ -106,7 +105,7 @@ class DetectionDataModule(pl.LightningDataModule):
         self.masks = []
         for _, row in polygons.iterrows():
             img_id = row["id"]
-            # skip images from other dataset
+            # skip images from not from selected datasets
             if df.loc[img_id, "dataset"] not in self.dataset_ids:
                 continue
             # read masks
@@ -221,6 +220,116 @@ class ImageDataModule(pl.LightningDataModule):
         self.val_dset = ImageDataset(
             root=self.root / "train",
             image_ids=val_ids,
+            transform=self.val_transform
+        )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dset, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dset, batch_size=self.batch_size,
+                          shuffle=False, num_workers=self.num_workers)
+
+
+class SegmentationDataset(Dataset):
+    def __init__(self, root: Path | str, image_ids: list[str],
+                 masks: np.ndarray, transform: Callable):
+        self.root = Path(root)
+        assert self.root.exists() and self.root.is_dir()
+        self.image_ids = image_ids
+        assert masks.ndim == 3 and masks.shape[0] == len(image_ids)
+        self.masks = masks
+        self.transform = transform
+
+    def __getitem__(self, idx) -> tuple[Tensor, Tensor]:
+        image_path = self.root / f"{self.image_ids[idx]}.tif"
+        image = cv2.imread(str(image_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = self.masks[idx]
+        transformed = self.transform(image=image, mask=mask)
+        image = transformed["image"]
+        if not isinstance(image, Tensor):
+            image = to_tensor(image)
+        mask = transformed["mask"]
+        if not isinstance(mask, Tensor):
+            mask = torch.tensor(mask)
+        # use float masks as segmentation targets
+        return image, mask.to(torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+
+class SegmentationDataModule(pl.LightningDataModule):
+    "Intended to do glomerulus semantic segmentation"
+    def __init__(self, root: Path | str, target_class: str,
+                 dataset_ids: list[int], train_transform: Callable,
+                 val_transform: Callable, split_seed: int | None = None,
+                 val_size: float = 0.1, batch_size: int = 2,
+                 num_workers: int = 2):
+        super().__init__()
+        self.root = Path(root)
+        assert self.root.exists() and self.root.is_dir()
+        assert target_class in CLASS_NAMES[:-1]
+        self.target_class = target_class
+        assert set(dataset_ids).issubset({1, 2})
+        self.dataset_ids = dataset_ids
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.split_seed = split_seed
+        self.val_size = val_size
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def prepare_data(self):
+        # read tile meta data to get dataset numbers and WSI
+        df = pd.read_csv(self.root / "tile_meta.csv")
+        df = df.set_index("id")  # set id as key
+        # read polygons.jsonl -- file with object masks
+        polygons = pd.read_json(self.root / "polygons.jsonl", lines=True)
+        self.images = []
+        self.masks = []
+        for _, row in polygons.iterrows():
+            img_id = row["id"]
+            # skip images not from selected datasets
+            if df.loc[img_id, "dataset"] not in self.dataset_ids:
+                continue
+            # read masks
+            masks_dict = parse_annotations(row["annotations"],
+                                           class_names=(self.target_class,))
+            masks = masks_dict[self.target_class]
+            # merge masks
+            if len(masks) > 0:
+                self.images.append(img_id)
+                masks = np.stack(masks, axis=0)
+                assert masks.ndim == 3
+                mask = masks.sum(0).clip(0, 1).astype(np.uint8)
+                self.masks.append(mask)
+        # cast masks to array
+        self.masks = np.stack(self.masks, axis=0)
+
+    def setup(self, stage: str):
+        # stratify by WSI
+        df = pd.read_csv(self.root / "tile_meta.csv").set_index("id")
+        stratify = [df.loc[img_id, "source_wsi"] for img_id in self.images]
+        # split data
+        train_idx, val_idx = train_test_split(
+            np.arange(len(self.images)),
+            test_size=self.val_size,
+            random_state=self.split_seed,
+            stratify=stratify
+        )
+        self.train_dset = SegmentationDataset(
+            root=self.root / "train",
+            image_ids=[self.images[ind] for ind in train_idx],
+            masks=self.masks[train_idx],
+            transform=self.train_transform
+        )
+        self.val_dset = SegmentationDataset(
+            root=self.root / "train",
+            image_ids=[self.images[ind] for ind in val_idx],
+            masks=self.masks[val_idx],
             transform=self.val_transform
         )
 

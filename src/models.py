@@ -35,7 +35,7 @@ def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
 
 
 class ResNetFeatures(nn.Module):
-    def __init__(self, num_layers: int = 50, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, num_layers: int = 50):
         super().__init__()
         # check argument values
         nl_lst = [18, 34, 50, 101, 152]
@@ -83,7 +83,7 @@ class ResNet50AutoEncoder(nn.Module):
                  trainable_backbone_layers: int = 3,
                  dropout: float | None = None):
         super().__init__()
-        self.encoder = ResNetFeatures(50, pretrained=pretrained)
+        self.encoder = ResNetFeatures(pretrained=pretrained, num_layers=50)
         self.encoder.set_n_trainable_layers(trainable_backbone_layers)
         # optionally drop random final feature map channels
         assert dropout is None or 0.0 <= dropout < 1.0
@@ -226,3 +226,96 @@ class MaskedAutoEncoder(pl.LightningModule):
 
     def configure_optimizers(self):
         return optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.wd)
+
+
+class PSDecoderBlock(nn.Module):
+    "Lightweight decoder block with PixelShuffle upsampling"
+    def __init__(self, in_channels: int, out_channels: int,
+                 skip_connection: bool = True, upscale_factor: int = 2):
+        super().__init__()
+        self.upsample = nn.PixelShuffle(upscale_factor=upscale_factor)
+        conv_channels = in_channels // upscale_factor**2
+        if skip_connection:
+            conv_channels *= 2
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(conv_channels, conv_channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(conv_channels),
+            nn.GELU(),
+            nn.Conv2d(conv_channels, out_channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+        self.skip_connection = skip_connection  # boolean flag
+
+    def forward(self, x: Tensor, skip_con: Tensor | None = None) -> Tensor:
+        x = self.upsample(x)
+        if skip_con is not None:
+            x = torch.cat([x, skip_con], dim=1)
+        return self.conv_block(x)
+
+
+class ResUNet(nn.Module):
+    "U-Net with ResNet backbone"
+    def __init__(self, pretrained: bool = True, resnet_layers: int = 50,
+                 out_channels: int = 1, trainable_backbone_layers: int = 3):
+        super().__init__()
+        assert resnet_layers >= 50, "ResNet18/34 not supported"
+        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+        self.encoder = ResNetFeatures(pretrained=pretrained,
+                                      num_layers=resnet_layers)
+        self.set_trainable_backbone_layers(trainable_backbone_layers)
+        self.sc_convs = nn.ModuleDict({
+            "relu": self._skip_con(64, 64),
+            "layer1": self._skip_con(256, 128),
+            "layer2": self._skip_con(512, 256),
+            "layer3": self._skip_con(1024, 512),
+        })
+        self.decoder = nn.ModuleList([
+            PSDecoderBlock(2048, 1024),
+            PSDecoderBlock(1024, 512),
+            PSDecoderBlock(512, 256),
+            PSDecoderBlock(256, 128),
+            PSDecoderBlock(128, 32, skip_connection=False)
+        ])
+        self.head = nn.Conv2d(32, out_channels, 1, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # encode input and collect intermediate feature maps
+        x = self.normalize(x)
+        skip_connections = [None]
+        for name, module in self.encoder.named_children():
+            x = module(x)
+            if name in self.sc_convs.keys():
+                skip_connections.append(self.sc_convs[name](x))
+        # decode collected feature maps
+        for module in self.decoder:
+            sc = skip_connections.pop()
+            x = module(x, sc)
+        # final transformation
+        return self.head(x)
+
+    @staticmethod
+    def _skip_con(c_in: int, c_out: int):
+        "Skip connection from encoder to decoder"
+        if c_in == c_out:
+            return nn.Identity()
+        return nn.Sequential(
+            nn.Conv2d(c_in, c_out, 1, 1, 0),
+            nn.GELU()
+        )
+
+    @staticmethod
+    def _dec_block(c_in: int, c_out: int) -> nn.Module:
+        return nn.Sequential(
+            nn.PixelShuffle(upscale_factor=2),
+            nn.Conv2d(c_in // 4, c_in // 4, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(c_in // 4),
+            nn.GELU(),
+            nn.Conv2d(c_in // 4, c_out, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.GELU()
+        )
+
+    def set_trainable_backbone_layers(self, n: int):
+        self.encoder.set_n_trainable_layers(n)
