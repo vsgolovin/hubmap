@@ -48,7 +48,7 @@ def main(seed: int, split_seed: int, test_size: float, lr: float, wd: float,
     )
     save_best = ModelCheckpoint(monitor="val_loss", mode="min")
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
-                                          name="denoising")
+                                          name="mae")
     trainer = pl.Trainer(
         max_epochs=epochs,
         accelerator="gpu",
