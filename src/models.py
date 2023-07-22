@@ -319,3 +319,66 @@ class ResUNet(nn.Module):
 
     def set_trainable_backbone_layers(self, n: int):
         self.encoder.set_n_trainable_layers(n)
+
+
+class DenoisingAutoEncoder(pl.LightningModule):
+    def __init__(self, lr: float, weight_decay: float = 0.0,
+                 pretrained: bool = True, resnet_layers: int = 50,
+                 trainable_backbone_layers: int = 3, noise_eps: float = 0.4):
+        super().__init__()
+        self.lr = lr
+        self.wd = weight_decay
+        self.model = ResUNet(
+            pretrained=pretrained,
+            resnet_layers=resnet_layers,
+            out_channels=1,
+            trainable_backbone_layers=trainable_backbone_layers
+        )
+        self.noise_eps = noise_eps
+        self.generator = None
+
+    def forward(self, x):
+        "Input should already be noisy"
+        return self.model(x)
+
+    def configure_optimizers(self):
+        return optim.Adam(self.model.parameters(), lr=self.lr,
+                          weight_decay=self.wd)
+
+    def training_step(self, batch, batch_idx):
+        # train model to predict added noise
+        noise = torch.randn(
+            size=(batch.size(0), 1, batch.size(2), batch.size(3)),
+            device=self.device
+        ) * self.noise_eps
+        inp = batch + noise
+        out = self(inp)
+        loss = ((out - noise)**2).mean()
+        self.log("train/loss", loss, prog_bar=True, on_step=False,
+                 on_epoch=True)
+        return loss
+
+    def on_validation_epoch_start(self):
+        self.generator = torch.Generator(device=self.device)
+        self.generator.manual_seed(2147483647)
+
+    def validation_step(self, batch, batch_idx):
+        # same as training, except same noise at every epoch
+        noise = torch.randn(
+            size=(batch.size(0), 1, batch.size(2), batch.size(3)),
+            generator=self.generator,
+            device=self.device
+        ) * self.noise_eps
+        inp = batch + noise
+        out = self(inp)
+        loss = ((out - noise)**2).mean()
+        self.log("val/loss", loss, prog_bar=True)
+        # save first batch of results
+        if batch_idx == 0:
+            img_stack = torch.cat(
+                [batch, inp.clip(0, 1), (inp - out).clip(0, 1)],
+                dim=0
+            )
+            grid = make_grid(img_stack, nrow=len(batch))
+            self.logger.experiment.add_image("denoising_results", grid,
+                                             self.current_epoch)

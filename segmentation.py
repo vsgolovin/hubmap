@@ -4,13 +4,84 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 import torch
 from torchvision.utils import make_grid
-from src.data import SegmentationDataModule
-from src.models import ResUNet
+from src.data import ImageDataModule, SegmentationDataModule
+from src.models import DenoisingAutoEncoder, ResUNet
 
 import click
 
 
-@click.command(context_settings={"show_default": True})
+@click.group()
+def cli():
+    pass
+
+
+@cli.command(context_settings={"show_default": True})
+@click.option("--seed", type=int, default=503417)
+@click.option("--split-seed", type=int, default=996634)
+@click.option("--bs", "--batch-size", type=int, default=16)
+@click.option("--accumulate-grad-batches", type=int, default=1)
+@click.option("--lr", "--learning-rate", type=float, default=9e-4)
+@click.option("--wd", "--weight-decay", type=float, default=0.0)
+@click.option("--epochs", type=int, default=50)
+@click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
+              default=0)
+@click.option("-n", "--noise-eps", type=float, default=0.4)
+def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
+             lr: float, wd: float, epochs: int, trainable_bb_layers: int,
+             noise_eps: float):
+    pl.seed_everything(seed)
+    torch.set_float32_matmul_precision("high")
+    dm = ImageDataModule(
+        root="./data",
+        train_transform=denoising_transform(train=True),
+        val_transform=denoising_transform(train=False),
+        split_seed=split_seed,
+        test_size=0.1,
+        batch_size=bs,
+        num_workers=min(bs, 8)
+    )
+    save_best = ModelCheckpoint(monitor="val/loss", save_top_k=1)
+    logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
+                                          name="denoising")
+    model = DenoisingAutoEncoder(
+        lr=lr,
+        weight_decay=wd,
+        pretrained=True,
+        resnet_layers=50,
+        trainable_backbone_layers=trainable_bb_layers,
+        noise_eps=noise_eps
+    )
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        logger=logger,
+        callbacks=[save_best],
+        max_epochs=epochs,
+        accumulate_grad_batches=accumulate_grad_batches
+    )
+    trainer.fit(model, dm)
+
+
+def denoising_transform(train: bool):
+    if train:
+        transforms = [
+            A.RandomCrop(224, 224),
+            A.HorizontalFlip(),
+            A.VerticalFlip(),
+            A.HueSaturationValue(10, 20, 10),
+            A.GaussianBlur(),
+        ]
+    else:
+        transforms = [
+            A.CenterCrop(224, 224)
+        ]
+    transforms.extend([
+        A.ToFloat(),
+        ToTensorV2()
+    ])
+    return A.Compose(transforms)
+
+
+@cli.command(context_settings={"show_default": True})
 @click.option("--seed", type=int, default=394039)
 @click.option("--split-seed", type=int, default=75389)
 @click.option("--bs", "--batch-size", type=int, default=3)
@@ -20,16 +91,18 @@ import click
 @click.option("--epochs", type=int, default=50)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=0)
-def main(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
-         lr: float, wd: float, epochs: int, trainable_bb_layers: int):
+@click.option("--weights", type=click.Path(), default="")
+def train(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
+          lr: float, wd: float, epochs: int, trainable_bb_layers: int,
+          weights: str):
     pl.seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     dm = SegmentationDataModule(
         root="./data",
         target_class="glomerulus",
         dataset_ids=[2],
-        train_transform=get_transform(train=True),
-        val_transform=get_transform(train=False),
+        train_transform=segmentation_transform(train=True),
+        val_transform=segmentation_transform(train=False),
         split_seed=split_seed,
         val_size=0.1,
         batch_size=bs,
@@ -41,6 +114,12 @@ def main(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         pretrained=True,
         trainable_backbone_layers=trainable_bb_layers
     )
+    if weights:
+        if weights.endswith(".ckpt"):
+            model.load_state_dict(torch.load(weights)["state_dict"])
+        else:
+            assert weights.endswith(".pth")
+            model.model.load_state_dict(torch.load(weights))
     save_best = ModelCheckpoint(monitor="val/loss", save_top_k=1)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="segmentation")
@@ -54,7 +133,7 @@ def main(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
     trainer.fit(model, dm)
 
 
-def get_transform(train: bool):
+def segmentation_transform(train: bool):
     if train:
         transforms = [
             A.HorizontalFlip(),
@@ -149,4 +228,4 @@ class LightningSegmentationModel(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    main()
+    cli()
