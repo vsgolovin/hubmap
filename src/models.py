@@ -305,20 +305,65 @@ class ResUNet(nn.Module):
             nn.GELU()
         )
 
-    @staticmethod
-    def _dec_block(c_in: int, c_out: int) -> nn.Module:
-        return nn.Sequential(
-            nn.PixelShuffle(upscale_factor=2),
-            nn.Conv2d(c_in // 4, c_in // 4, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(c_in // 4),
+    def set_trainable_backbone_layers(self, n: int):
+        self.encoder.set_n_trainable_layers(n)
+
+
+class UpsampleDecoderBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int,
+                 out_channels: int, scale_factor: int = 2):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=scale_factor)
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels + skip_channels, out_channels, 3, 1, 1,
+                      bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.GELU(),
-            nn.Conv2d(c_in // 4, c_out, 1, 1, 0, bias=False),
-            nn.BatchNorm2d(c_out),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.GELU()
         )
 
+    def forward(self, x: Tensor, skip_con: Tensor | None) -> Tensor:
+        x = self.upsample(x)
+        if skip_con is not None:
+            x = torch.cat([x, skip_con], dim=1)
+        return self.conv_block(x)
+
+
+class EfficientUNet(nn.Module):
+    def __init__(self, pretrained: bool = True, out_channels: int = 1,
+                 trainable_backbone_layers: int = 0):
+        super().__init__()
+        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+        weights = "DEFAULT" if pretrained else None
+        self.encoder = models.efficientnet_b5(weights=weights).features[:-1]
+        self.set_trainable_backbone_layers(trainable_backbone_layers)
+        self.decoder = nn.ModuleList([
+            UpsampleDecoderBlock(512, 176, 256),
+            UpsampleDecoderBlock(256, 64, 128),
+            UpsampleDecoderBlock(128, 40, 64),
+            UpsampleDecoderBlock(64, 24, 64),
+            UpsampleDecoderBlock(64, 0, 32)
+        ])
+        self.head = nn.Conv2d(32, out_channels, 1, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.normalize(x)
+        features = [None]
+        for i, module in enumerate(self.encoder.children()):
+            x = module(x)
+            if i in [1, 2, 3, 5]:
+                features.append(x)
+        for module in self.decoder.children():
+            x = module(x, features.pop())
+        return self.head(x)
+
     def set_trainable_backbone_layers(self, n: int):
-        self.encoder.set_n_trainable_layers(n)
+        assert 0 <= n <= 8
+        for i, module in enumerate(self.encoder.children()):
+            module.requires_grad_(i > (7 - n))
 
 
 class DenoisingAutoEncoder(pl.LightningModule):
@@ -336,6 +381,7 @@ class DenoisingAutoEncoder(pl.LightningModule):
         )
         self.noise_eps = noise_eps
         self.generator = None
+        self.save_hyperparameters()
 
     def forward(self, x):
         "Input should already be noisy"
