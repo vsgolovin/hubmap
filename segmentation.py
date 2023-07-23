@@ -20,12 +20,12 @@ def cli():
 @click.option("--split-seed", type=int, default=996634)
 @click.option("--bs", "--batch-size", type=int, default=16)
 @click.option("--accumulate-grad-batches", type=int, default=1)
-@click.option("--lr", "--learning-rate", type=float, default=9e-4)
+@click.option("--lr", "--learning-rate", type=float, default=3e-4)
 @click.option("--wd", "--weight-decay", type=float, default=0.0)
 @click.option("--epochs", type=int, default=50)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=0)
-@click.option("-n", "--noise-eps", type=float, default=0.4)
+@click.option("-n", "--noise-eps", type=float, default=0.2)
 def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
              lr: float, wd: float, epochs: int, trainable_bb_layers: int,
              noise_eps: float):
@@ -88,13 +88,14 @@ def denoising_transform(train: bool):
 @click.option("--accumulate-grad-batches", type=int, default=4)
 @click.option("--lr", "--learning-rate", type=float, default=4e-3)
 @click.option("--wd", "--weight-decay", type=float, default=0.0)
+@click.option("--cosine-annealing-periods", type=int, default=0)
 @click.option("--epochs", type=int, default=50)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=0)
 @click.option("--weights", type=click.Path(), default="")
 def train(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
-          lr: float, wd: float, epochs: int, trainable_bb_layers: int,
-          weights: str):
+          lr: float, wd: float, cosine_annealing_periods: bool, epochs: int,
+          trainable_bb_layers: int, weights: str):
     pl.seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     dm = SegmentationDataModule(
@@ -108,9 +109,14 @@ def train(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         batch_size=bs,
         num_workers=min(bs, 12)
     )
+    if cosine_annealing_periods:
+        ca_steps = epochs // cosine_annealing_periods
+    else:
+        ca_steps = 0
     model = LightningSegmentationModel(
         lr=lr,
         weight_decay=wd,
+        cosine_annealing_steps=ca_steps,
         pretrained=True,
         trainable_backbone_layers=trainable_bb_layers
     )
@@ -120,7 +126,7 @@ def train(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         else:
             assert weights.endswith(".pth")
             model.model.load_state_dict(torch.load(weights))
-    save_best = ModelCheckpoint(monitor="val/loss", save_top_k=1)
+    save_best = ModelCheckpoint(monitor="val/loss", save_top_k=2)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="segmentation")
     trainer = pl.Trainer(
@@ -152,7 +158,8 @@ def segmentation_transform(train: bool):
 
 class LightningSegmentationModel(pl.LightningModule):
     def __init__(self, lr: float, weight_decay: float = 0.0,
-                 pretrained: bool = True, trainable_backbone_layers: int = 3,
+                 cosine_annealing_steps: int = 0, pretrained: bool = True,
+                 trainable_backbone_layers: int = 3,
                  dice_loss_eps: float = 1.0):
         super().__init__()
         self.lr = lr
@@ -162,6 +169,7 @@ class LightningSegmentationModel(pl.LightningModule):
             out_channels=1,
             trainable_backbone_layers=trainable_backbone_layers
         )
+        self.cosine_annealing_steps = cosine_annealing_steps
         self.dice_loss_eps = dice_loss_eps
         self.save_hyperparameters()
 
@@ -169,8 +177,18 @@ class LightningSegmentationModel(pl.LightningModule):
         return self.model(x).squeeze(1)  # logits
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.lr,
-                                weight_decay=self.weight_decay)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr,
+                                     weight_decay=self.weight_decay)
+        if self.cosine_annealing_steps == 0:
+            return optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=self.cosine_annealing_steps)
+        return {"optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "frequency": 1
+                }}
 
     def dice_loss(self, pred, target):
         pred = torch.flatten(pred, start_dim=1)
