@@ -38,7 +38,7 @@ def main(seed: int, split_seed: int, test_size: float, lr: float, wd: float,
         trainable_backbone_layers=trainable_bb_layers,
     )
     dm = ImageDataModule(
-        root="data",
+        root="data/hubmap",
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
         split_seed=split_seed,

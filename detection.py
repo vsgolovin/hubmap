@@ -44,7 +44,7 @@ def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
 
     # load data
     dm = DetectionDataModule(
-        root="./data",
+        root="./data/hubmap",
         target_class="blood_vessel",
         dataset_ids=[2],
         train_transform=get_transform(train=True),
@@ -127,7 +127,7 @@ def stage2(ckpt: str, seed: int, split_seed: int, bs: int,
 
     # load data
     dm = DetectionDataModule(
-        root="./data",
+        root="./data/hubmap",
         target_class="blood_vessel",
         dataset_ids=[1],
         train_transform=get_transform(train=True),
@@ -187,7 +187,7 @@ def stage2(ckpt: str, seed: int, split_seed: int, bs: int,
 def test(ckpt: str, seed: int, split_seed: int, bs: int, v2: bool):
     pl.seed_everything(seed)
     dm = DetectionDataModule(
-        root="./data",
+        root="./data/hubmap",
         target_class="blood_vessel",
         dataset_ids=[1],
         train_transform=get_transform(train=True),

@@ -32,7 +32,7 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
     pl.seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     dm = ImageDataModule(
-        root="./data",
+        root="./data/hubmap",
         train_transform=denoising_transform(train=True),
         val_transform=denoising_transform(train=False),
         split_seed=split_seed,
@@ -99,7 +99,7 @@ def train(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
     pl.seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     dm = SegmentationDataModule(
-        root="./data",
+        root="./data/hubmap",
         target_class="glomerulus",
         dataset_ids=[2],
         train_transform=segmentation_transform(train=True),
