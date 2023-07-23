@@ -10,22 +10,122 @@ from src.models import get_maskrcnn
 
 import click
 
-MODEL_DIR = Path("models")
+
+BACKBONE_DIR = Path("models/backbones")
 
 
-@click.command(context_settings={"show_default": True})
+@click.group()
+def cli():
+    pass
+
+
+@cli.command(context_settings={"show_default": True})
 @click.option("--seed", type=int, default=5511)
 @click.option("--split-seed", type=int, default=4277)
+@click.option("--bs", "--batch-size", type=int, default=1)
+@click.option("--accumulate-grad-batches", type=int, default=16)
 @click.option("--lr", "--learning-rate", type=float, default=8e-5)
+@click.option("--weight-decay", type=float, default=0.0)
+@click.option("--epochs", type=int, default=30)
+@click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
+              default=0)
+@click.option("--v2", is_flag=True, default=False)
+@click.option("--predictor-hidden-size", type=int, default=256)
+@click.option("-w", "--backbone-weights", type=str, default="default")
+@click.option("--lr-find", is_flag=True, default=False)
+@click.option("-T", "--cosine-annealing-periods", type=int, default=1)
+def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
+           lr: float, weight_decay: float, epochs: int,
+           trainable_bb_layers: int, v2: bool, predictor_hidden_size: int,
+           backbone_weights: str, lr_find: bool,
+           cosine_annealing_periods: int):
+    "Train model on dataset 2"
+    pl.seed_everything(seed)
+
+    # load data
+    dm = DetectionDataModule(
+        root="./data",
+        target_class="blood_vessel",
+        dataset_ids=[2],
+        train_transform=get_transform(train=True),
+        val_transform=get_transform(train=False),
+        split_seed=split_seed,
+        batch_size=bs,
+        num_workers=min(bs, 8)
+    )
+
+    # use cosine annealing with warm restarts
+    if cosine_annealing_periods:
+        ca_steps = epochs // cosine_annealing_periods
+    else:
+        ca_steps = 0
+
+    # mask r-cnn wrapper
+    model = LitMaskRCNN(
+        lr=lr,
+        weight_decay=weight_decay,
+        ca_steps=ca_steps,
+        pretrained=True,
+        trainable_backbone_layers=trainable_bb_layers,
+        num_classes=2,
+        v2=v2,
+        predictor_hidden_size=predictor_hidden_size
+    )
+
+    # load pretrained backbone weights
+    if backbone_weights != "default":
+        model.model.backbone.body.load_state_dict(
+            torch.load(BACKBONE_DIR / f"{backbone_weights}.pth"),
+            strict=False
+        )
+
+    # training settings
+    save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
+                                save_top_k=2)
+    logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
+                                          name="detection/dset2")
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        max_epochs=epochs,
+        accumulate_grad_batches=accumulate_grad_batches,
+        callbacks=[save_best],
+        logger=logger,
+    )
+
+    # find initial learning rate with pytorch-lightning
+    if lr_find:
+        tuner = pl.tuner.Tuner(trainer)
+        tuner.lr_find(model, dm)
+
+    # train the model
+    trainer.fit(model, dm)
+
+    # compute mean average precision on test (== val)
+    model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
+    trainer.test(model, dm.val_dataloader())
+
+
+@cli.command(context_settings={"show_default": True})
+@click.argument("ckpt", type=click.Path())
+@click.option("--seed", type=int, default=5511)
+@click.option("--split-seed", type=int, default=4277)
+@click.option("--bs", "--batch-size", type=int, default=1)
+@click.option("--accumulate-grad-batches", type=int, default=16)
+@click.option("--lr", "--learning-rate", type=float, default=8e-5)
+@click.option("--weight-decay", type=float, default=0.0)
 @click.option("--epochs", type=int, default=12)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=3)
-@click.option("-w", "--backbone-weights", type=str, default="default")
-def main(seed: int, split_seed: int, lr: float, epochs: int,
-         trainable_bb_layers: int, backbone_weights: str):
+@click.option("--lr-find", is_flag=True, default=False)
+@click.option("-T", "--cosine-annealing-periods", type=int, default=1)
+def stage2(ckpt: str, seed: int, split_seed: int, bs: int,
+           accumulate_grad_batches: int, lr: float, weight_decay: float,
+           epochs: int, trainable_bb_layers: int, lr_find: bool,
+           cosine_annealing_periods: int):
+    "Fine-tune pretrained model on dataset 1"
     pl.seed_everything(seed)
 
-    # datasets and dataloaders
+    # load data
     dm = DetectionDataModule(
         root="./data",
         target_class="blood_vessel",
@@ -33,36 +133,74 @@ def main(seed: int, split_seed: int, lr: float, epochs: int,
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
         split_seed=split_seed,
-        batch_size=2,
-        num_workers=2
+        batch_size=bs,
+        num_workers=min(bs, 8)
     )
 
-    # create and train the model
-    model = LitMaskRCNN(lr=lr, pretrained=True,
-                        trainable_backbone_layers=trainable_bb_layers)
-    if backbone_weights != "default":
-        model.model.backbone.body.load_state_dict(
-            torch.load(MODEL_DIR / f"{backbone_weights}.pth"),
-            strict=False
-        )
-    save_best = ModelCheckpoint(monitor="val_loss/total", mode="min")
+    # use cosine annealing with warm restarts
+    if cosine_annealing_periods:
+        ca_steps = epochs // cosine_annealing_periods
+    else:
+        ca_steps = 0
+
+    # load checkpoint and override some hyperparameters
+    model = LitMaskRCNN.load_from_checkpoint(
+        checkpoint_path=ckpt,
+        lr=lr,
+        weight_decay=weight_decay,
+        ca_steps=ca_steps,
+        trainable_backbone_layers=trainable_bb_layers
+    )
+
+    # training settings
+    save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
+                                save_top_k=2)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
-                                          name="detection")
+                                          name="detection/dset1")
     trainer = pl.Trainer(
         accelerator="gpu",
         max_epochs=epochs,
-        accumulate_grad_batches=8,
-        log_every_n_steps=16,
+        accumulate_grad_batches=accumulate_grad_batches,
         callbacks=[save_best],
         logger=logger,
     )
+
+    # find initial learning rate with pytorch-lightning
+    if lr_find:
+        tuner = pl.tuner.Tuner(trainer)
+        tuner.lr_find(model, dm)
+
+    # train the model
     trainer.fit(model, dm)
 
     # compute mean average precision on test (== val)
     model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
     trainer.test(model, dm.val_dataloader())
-    # export state dict
-    torch.save(model.model.state_dict(), MODEL_DIR / "mask_r-cnn.pth")
+
+
+@cli.command(context_settings={"show_default": True})
+@click.argument("ckpt", type=click.Path())
+@click.option("--seed", type=int, default=5511)
+@click.option("--split-seed", type=int, default=4277)
+@click.option("--bs", "--batch-size", type=int, default=1)
+@click.option("--v2", is_flag=True, default=False)
+def test(ckpt: str, seed: int, split_seed: int, bs: int, v2: bool):
+    pl.seed_everything(seed)
+    dm = DetectionDataModule(
+        root="./data",
+        target_class="blood_vessel",
+        dataset_ids=[1],
+        train_transform=get_transform(train=True),
+        val_transform=get_transform(train=False),
+        split_seed=split_seed,
+        batch_size=bs,
+        num_workers=(bs, 8)
+    )
+    model = LitMaskRCNN.load_from_checkpoint(ckpt, v2=v2)
+    trainer = pl.Trainer(accelerator="gpu", logger=None)
+    dm.prepare_data()
+    dm.setup("fit")
+    trainer.test(model, dm.val_dataloader())
 
 
 def get_transform(train: bool = True):
@@ -85,10 +223,13 @@ def get_transform(train: bool = True):
 class LitMaskRCNN(pl.LightningModule):
     LOSS_NAMES = ("classifier", "box_reg", "mask", "objectness", "rpn_box_reg")
 
-    def __init__(self, lr: float = 3e-4, **kwargs):
+    def __init__(self, lr: float, weight_decay: float, ca_steps: int,
+                 **kwargs):
         super().__init__()
         self.lr = lr
-        self.model = get_maskrcnn(num_classes=2, **kwargs)
+        self.wd = weight_decay
+        self.ca_steps = ca_steps
+        self.model = get_maskrcnn(**kwargs)
         self.test_preds = []
         self.test_targets = []
         self.save_hyperparameters()
@@ -99,17 +240,28 @@ class LitMaskRCNN(pl.LightningModule):
         return self.model(images)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr,
+                                     weight_decay=self.wd)
+        if self.ca_steps == 0:
+            return optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer=optimizer, T_0=self.ca_steps)
+        return {"optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "frequency": 1
+                }}
 
     def training_step(self, batch, batch_idx):
         batch_size = len(batch[0])
         loss_dict = self(batch[0], batch[1])
         for ln in self.LOSS_NAMES:
             self.log(f"train_loss/{ln}", loss_dict[f"loss_{ln}"],
-                     batch_size=batch_size)
+                     batch_size=batch_size, on_step=False, on_epoch=True)
         loss = sum(loss_dict.values())
         self.log("train_loss/total", loss, prog_bar=True,
-                 batch_size=batch_size)
+                 batch_size=batch_size, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -139,4 +291,4 @@ class LitMaskRCNN(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    main()
+    cli()

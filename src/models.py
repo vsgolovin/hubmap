@@ -3,7 +3,7 @@ import torch
 from torch import nn, optim, Tensor
 from torch.nn.functional import interpolate
 from torchvision import models
-from torchvision.models.detection import maskrcnn_resnet50_fpn
+from torchvision.models import detection
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.transforms import Normalize
@@ -11,10 +11,15 @@ from torchvision.utils import make_grid
 
 
 def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
-                 num_classes: int = 2, predictor_hidden_size: int = 256):
+                 num_classes: int = 2, v2: bool = False,
+                 predictor_hidden_size: int = 256) -> detection.FasterRCNN:
     # load model
-    weights = "COCO_V1" if pretrained else None
-    model = maskrcnn_resnet50_fpn(weights=weights)
+    weights = "DEFAULT" if pretrained else None
+    if v2:
+        constructor = detection.maskrcnn_resnet50_fpn_v2
+    else:
+        constructor = detection.maskrcnn_resnet50_fpn
+    model = constructor(weights=weights, weights_backbone=weights)
 
     # freeze backbone layers
     assert 0 <= trainable_backbone_layers <= 5
