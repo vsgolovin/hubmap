@@ -5,7 +5,7 @@ import torch
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from src.data import DetectionDataModule
+from src.data import DetectionDataModule, MyDetectionDataModule
 from src.models import get_maskrcnn
 
 import click
@@ -24,35 +24,38 @@ def cli():
 @click.option("--split-seed", type=int, default=4277)
 @click.option("--bs", "--batch-size", type=int, default=1)
 @click.option("--accumulate-grad-batches", type=int, default=16)
-@click.option("--lr", "--learning-rate", type=float, default=8e-5)
+@click.option("--lr", "--learning-rate", type=float, default=1e-4)
 @click.option("--weight-decay", type=float, default=0.0)
-@click.option("--epochs", type=int, default=30)
+@click.option("--epochs", type=int, default=10)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
-              default=0)
+              default=2)
 @click.option("--v2", is_flag=True, default=False)
 @click.option("--predictor-hidden-size", type=int, default=256)
 @click.option("-w", "--backbone-weights", type=str, default="default")
 @click.option("--lr-find", is_flag=True, default=False)
 @click.option("-T", "--cosine-annealing-periods", type=int, default=1)
-def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
-           lr: float, weight_decay: float, epochs: int,
-           trainable_bb_layers: int, v2: bool, predictor_hidden_size: int,
-           backbone_weights: str, lr_find: bool,
-           cosine_annealing_periods: int):
-    "Train model on dataset 2"
+@click.option("--confidence-threshold", default=0.9,
+              type=click.FloatRange(0, 1, max_open=True))
+def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
+             lr: float, weight_decay: float, epochs: int,
+             trainable_bb_layers: int, v2: bool, predictor_hidden_size: int,
+             backbone_weights: str, lr_find: bool,
+             cosine_annealing_periods: int, confidence_threshold: float):
+    "Train model on dataset 2 and 3 images annotated with previous model"
     pl.seed_everything(seed)
 
     # load data
-    dm = DetectionDataModule(
+    dm = MyDetectionDataModule(
         root="./data/hubmap",
-        target_class="blood_vessel",
-        dataset_ids=[2],
+        annotation_dir="./data/annotations",
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
         split_seed=split_seed,
         batch_size=bs,
-        num_workers=min(bs, 8)
+        num_workers=min(bs, 8),
+        confidence_threshold=confidence_threshold
     )
+    dm.prepare_data()
 
     # use cosine annealing with warm restarts
     if cosine_annealing_periods:
@@ -83,7 +86,7 @@ def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
     save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
                                 save_top_k=2)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
-                                          name="detection/dset2")
+                                          name="detection/pretraining")
     trainer = pl.Trainer(
         accelerator="gpu",
         max_epochs=epochs,
@@ -100,13 +103,9 @@ def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
     # train the model
     trainer.fit(model, dm)
 
-    # compute mean average precision on test (== val)
-    model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
-    trainer.test(model, dm.val_dataloader())
-
 
 @cli.command(context_settings={"show_default": True})
-@click.argument("ckpt", type=click.Path())
+@click.option("--ckpt", type=click.Path())
 @click.option("--seed", type=int, default=5511)
 @click.option("--split-seed", type=int, default=4277)
 @click.option("--bs", "--batch-size", type=int, default=1)
@@ -116,12 +115,15 @@ def stage1(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
 @click.option("--epochs", type=int, default=12)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=3)
+@click.option("--v2", is_flag=True, default=False)
+@click.option("--predictor-hidden-size", type=int, default=256)
 @click.option("--lr-find", is_flag=True, default=False)
 @click.option("-T", "--cosine-annealing-periods", type=int, default=1)
-def stage2(ckpt: str, seed: int, split_seed: int, bs: int,
-           accumulate_grad_batches: int, lr: float, weight_decay: float,
-           epochs: int, trainable_bb_layers: int, lr_find: bool,
-           cosine_annealing_periods: int):
+def finetune(ckpt: str, seed: int, split_seed: int, bs: int,
+             accumulate_grad_batches: int, lr: float, weight_decay: float,
+             epochs: int, trainable_bb_layers: int, v2: bool,
+             predictor_hidden_size: int, lr_find: bool,
+             cosine_annealing_periods: int):
     "Fine-tune pretrained model on dataset 1"
     pl.seed_everything(seed)
 
@@ -137,20 +139,33 @@ def stage2(ckpt: str, seed: int, split_seed: int, bs: int,
         num_workers=min(bs, 8)
     )
 
-    # use cosine annealing with warm restarts
+    # use cosine annealing (> 0) with warm restarts (> 1)
     if cosine_annealing_periods:
         ca_steps = epochs // cosine_annealing_periods
     else:
         ca_steps = 0
 
     # load checkpoint and override some hyperparameters
-    model = LitMaskRCNN.load_from_checkpoint(
-        checkpoint_path=ckpt,
-        lr=lr,
-        weight_decay=weight_decay,
-        ca_steps=ca_steps,
-        trainable_backbone_layers=trainable_bb_layers
-    )
+    if ckpt:
+        model = LitMaskRCNN.load_from_checkpoint(
+            checkpoint_path=ckpt,
+            lr=lr,
+            weight_decay=weight_decay,
+            ca_steps=ca_steps,
+            trainable_backbone_layers=trainable_bb_layers,
+            v2=v2
+        )
+    else:
+        model = LitMaskRCNN(
+            lr=lr,
+            weight_decay=weight_decay,
+            ca_steps=ca_steps,
+            pretrained=True,
+            trainable_backbone_layers=trainable_bb_layers,
+            num_classes=2,
+            v2=v2,
+            predictor_hidden_size=predictor_hidden_size
+        )
 
     # training settings
     save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
@@ -194,10 +209,10 @@ def test(ckpt: str, seed: int, split_seed: int, bs: int, v2: bool):
         val_transform=get_transform(train=False),
         split_seed=split_seed,
         batch_size=bs,
-        num_workers=(bs, 8)
+        num_workers=min(bs, 8)
     )
     model = LitMaskRCNN.load_from_checkpoint(ckpt, v2=v2)
-    trainer = pl.Trainer(accelerator="gpu", logger=None)
+    trainer = pl.Trainer(accelerator="gpu", logger=False)
     dm.prepare_data()
     dm.setup("fit")
     trainer.test(model, dm.val_dataloader())

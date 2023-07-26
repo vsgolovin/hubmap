@@ -174,7 +174,7 @@ class ImageDataset(Dataset):
         self.image_ids = tuple(image_ids)
         self.transform = transform
 
-    def __getitem__(self, idx) -> tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, idx) -> Tensor:
         path = self.root / f"{self.image_ids[idx]}.tif"
         image = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
         image = self.transform(image=image)["image"]
@@ -340,3 +340,197 @@ class SegmentationDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(self.val_dset, batch_size=self.batch_size,
                           shuffle=False, num_workers=self.num_workers)
+
+
+class MyDetectionDataset(Dataset):
+    "Unannotated images with annotations by Mask R-CNN"
+    def __init__(self, image_dir: Path | str, image_ids: list[str],
+                 annotations: pd.DataFrame, annotation_dir: Path | str,
+                 transform: Callable,
+                 confidence_threshold: float | None = None,
+                 overlap_threshold: float = 0.9):
+        """
+        Parameters
+        ----------
+            image_dir: Path | str
+                Path to dataset images, i.e. "data/hubmap/train".
+            image_ids: list[str]
+                Filenames (without extenstion) of used images.
+            annotations: pd.DataFrame
+                Slice of `polygons.jsonl` indexed by image id.
+            annotation_dir: Path | str
+                Path to directory with image annotations created by previously
+                trained detector.
+            transform: Callable
+                `albumentations` transform.
+            confidence_threshold: float | None
+                Only return detections with confidence exceeding this value.
+            overlap_theshold: float
+                Threshold for removing strongly overlapping detections.
+        """
+        self.image_dir = Path(image_dir)
+        self.image_ids = image_ids
+        self.annotations = annotations
+        self.ann_dir = Path(annotation_dir)
+        self.transform = transform
+        self.confidence_threshold = confidence_threshold
+        self.overlap_threshold = overlap_threshold
+
+    def __getitem__(self, idx):
+        image_id = self.image_ids[idx]
+
+        # load image
+        image_path = self.image_dir / f"{image_id}.tif"
+        image = cv2.imread(str(image_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # load masks
+        # if image is from dataset 2, load original annotations
+        ann_lst = self.annotations["annotations"].get(image_id, [])
+        if ann_lst:
+            masks = parse_annotations(ann_lst, ("blood_vessel",),
+                                      duplicate_thresh=self.overlap_threshold
+                                      )["blood_vessel"]
+            seen = masks.sum(0).astype(bool)
+            masks = list(masks)
+        else:
+            masks = []
+            seen = np.zeros((512, 512), dtype=bool)
+        # now add detections from previously trained model
+        npz_file = self.ann_dir / f"{image_id}.npz"
+        if npz_file.exists():
+            masks_npz = np.load(npz_file)
+            for score_str, coords in masks_npz.items():
+                score = float(score_str)
+                if (self.confidence_threshold
+                        and score < self.confidence_threshold):
+                    break  # keys are sorted
+                mask = cv2.fillPoly(np.zeros((512, 512), dtype=np.uint8),
+                                    pts=[coords], color=1)
+                mask_b = mask.astype(bool)
+                if ((mask_b & seen).sum() / mask_b.sum() <
+                        self.overlap_threshold):
+                    masks.append(mask)
+                    seen |= mask_b
+
+        # apply transform
+        out = self.transform(image=image, masks=masks)
+        return out["image"], out["masks"]
+
+    def __len__(self) -> int:
+        return len(self.image_ids)
+
+
+class MyDetectionDataModule(pl.LightningDataModule):
+    def __init__(self, root: Path | str, annotation_dir: Path | str,
+                 train_transform: Callable, val_transform: Callable,
+                 split_seed: int | None = None, val_size: float = 0.15,
+                 batch_size: int = 2, num_workers: int = 2,
+                 confidence_threshold: float | None = None,
+                 overlap_threshold: float = 0.9):
+        super().__init__()
+        self.root = Path(root)
+        assert self.root.exists() and self.root.is_dir()
+        self.ann_dir = Path(annotation_dir)
+        assert self.ann_dir.exists() and self.ann_dir.is_dir()
+        self.image_ids_ds2 = []
+        self.image_ids_ds3 = []
+        self.train_transform = train_transform
+        self.val_transform = val_transform
+        self.split_seed = split_seed
+        self.val_size = val_size
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.confidence_threshold = confidence_threshold
+        self.overlap_threshold = overlap_threshold
+
+    def prepare_data(self):
+        # read tile meta data to get dataset numbers and WSI
+        self.tile_meta = pd.read_csv(self.root / "tile_meta.csv")  \
+            .set_index("id")
+        # all dataset 2 images
+        self.image_ids_ds2 = self.tile_meta.index[
+            self.tile_meta["dataset"] == 2].to_list()
+
+        # images from dataset 3
+        self.image_ids_ds3 = []
+        for file in self.ann_dir.iterdir():
+            if file.suffix != ".npz":
+                continue
+            image_id = file.stem
+            assert (self.root / "train" / f"{image_id}.tif").exists()
+            if self.tile_meta.loc[image_id, "dataset"] == 3:
+                if self.confidence_threshold:
+                    masks_npz = np.load(self.ann_dir / f"{image_id}.npz")
+                    scores = [float(score) for score in masks_npz.keys()]
+                    if all(s < self.confidence_threshold for s in scores):
+                        continue  # no confident predictions
+                self.image_ids_ds3.append(image_id)
+
+        # find ground-truth (sort of) annotations of dataset 2 images
+        polygons = pd.read_json(self.root / "polygons.jsonl", lines=True)
+        keep = [False] * len(polygons)
+        for i, row in polygons.iterrows():
+            # check if we use this image in current dataset
+            if self.tile_meta.loc[row["id"], "dataset"] != 2:
+                continue
+            # next check for blood vessel detections
+            keep[i] = any(d["type"] == "blood_vessel"
+                          for d in row["annotations"])
+            if not keep[i]:
+                masks_npz = np.load(self.ann_dir / f"{row['id']}.npz")
+                scores = [float(score) for score in masks_npz.keys()]
+                if all(s < self.confidence_threshold for s in scores):
+                    self.image_ids_ds2.remove(row["id"])
+        self.annotations = polygons[keep].set_index("id")
+        assert len(self.annotations) == 1206
+
+    def setup(self, stage: str):
+        # stratify by dataset and WSI
+        # first split dataset 2 images
+        wsi = self.tile_meta.loc[self.image_ids_ds2, "source_wsi"].to_numpy()
+        train_ds2, val_ds2 = train_test_split(
+            self.image_ids_ds2,
+            test_size=self.val_size,
+            random_state=self.split_seed,
+            stratify=wsi
+        )
+        # now split dataset 3 images
+        wsi = self.tile_meta.loc[self.image_ids_ds3, "source_wsi"].to_numpy()
+        train_ds3, val_ds3 = train_test_split(
+            self.image_ids_ds3,
+            test_size=self.val_size,
+            random_state=self.split_seed,
+            stratify=wsi
+        )
+        # create dataset objects
+        train_in_df = self.annotations.index.intersection(train_ds2)
+        self.train_dset = MyDetectionDataset(
+            image_dir=self.root / "train",
+            image_ids=train_ds2 + train_ds3,
+            annotations=self.annotations.loc[train_in_df, :],
+            annotation_dir=self.ann_dir,
+            transform=self.train_transform,
+            confidence_threshold=self.confidence_threshold,
+            overlap_threshold=self.overlap_threshold
+        )
+        val_in_df = self.annotations.index.intersection(val_ds2)
+        self.val_dset = MyDetectionDataset(
+            image_dir=self.root / "train",
+            image_ids=val_ds2 + val_ds3,
+            annotations=self.annotations.loc[val_in_df, :],
+            annotation_dir=self.ann_dir,
+            transform=self.train_transform,
+            confidence_threshold=self.confidence_threshold,
+            overlap_threshold=self.overlap_threshold
+        )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dset, batch_size=self.batch_size,
+                          shuffle=True, num_workers=self.num_workers,
+                          collate_fn=DetectionDataModule.collate_fn)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dset, batch_size=self.batch_size,
+                          shuffle=False, num_workers=self.num_workers,
+                          collate_fn=DetectionDataModule.collate_fn)
