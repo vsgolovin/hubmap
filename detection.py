@@ -1,6 +1,7 @@
 from pathlib import Path
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import numpy as np
 import torch
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import pytorch_lightning as pl
@@ -55,7 +56,6 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         num_workers=min(bs, 8),
         confidence_threshold=confidence_threshold
     )
-    dm.prepare_data()
 
     # use cosine annealing with warm restarts
     if cosine_annealing_periods:
@@ -83,7 +83,7 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         )
 
     # training settings
-    save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
+    save_best = ModelCheckpoint(monitor="val_mAP", mode="max",
                                 save_top_k=2)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="detection/pretraining")
@@ -168,7 +168,7 @@ def finetune(ckpt: str, seed: int, split_seed: int, bs: int,
         )
 
     # training settings
-    save_best = ModelCheckpoint(monitor="val_loss/total", mode="min",
+    save_best = ModelCheckpoint(monitor="val_mAP", mode="max",
                                 save_top_k=2)
     logger = pl.loggers.TensorBoardLogger(save_dir="lightning_logs",
                                           name="detection/dset1")
@@ -187,35 +187,6 @@ def finetune(ckpt: str, seed: int, split_seed: int, bs: int,
 
     # train the model
     trainer.fit(model, dm)
-
-    # compute mean average precision on test (== val)
-    model = LitMaskRCNN.load_from_checkpoint(save_best.best_model_path)
-    trainer.test(model, dm.val_dataloader())
-
-
-@cli.command(context_settings={"show_default": True})
-@click.argument("ckpt", type=click.Path())
-@click.option("--seed", type=int, default=5511)
-@click.option("--split-seed", type=int, default=4277)
-@click.option("--bs", "--batch-size", type=int, default=1)
-@click.option("--v2", is_flag=True, default=False)
-def test(ckpt: str, seed: int, split_seed: int, bs: int, v2: bool):
-    pl.seed_everything(seed)
-    dm = DetectionDataModule(
-        root="./data/hubmap",
-        target_class="blood_vessel",
-        dataset_ids=[1],
-        train_transform=get_transform(train=True),
-        val_transform=get_transform(train=False),
-        split_seed=split_seed,
-        batch_size=bs,
-        num_workers=min(bs, 8)
-    )
-    model = LitMaskRCNN.load_from_checkpoint(ckpt, v2=v2)
-    trainer = pl.Trainer(accelerator="gpu", logger=False)
-    dm.prepare_data()
-    dm.setup("fit")
-    trainer.test(model, dm.val_dataloader())
 
 
 def get_transform(train: bool = True):
@@ -245,8 +216,10 @@ class LitMaskRCNN(pl.LightningModule):
         self.wd = weight_decay
         self.ca_steps = ca_steps
         self.model = get_maskrcnn(**kwargs)
-        self.test_preds = []
-        self.test_targets = []
+        self.val_preds = []
+        self.val_targets = []
+        self.mean_ap_values = []
+        self.mean_ap_counts = []
         self.save_hyperparameters()
 
     def forward(self, images, targets=None):
@@ -279,30 +252,32 @@ class LitMaskRCNN(pl.LightningModule):
                  batch_size=batch_size, on_step=False, on_epoch=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        batch_size = len(batch[0])
-        self.train()
-        loss_dict = self.model(batch[0], batch[1])
-        for ln in self.LOSS_NAMES:
-            self.log(f"val_loss/{ln}", loss_dict[f"loss_{ln}"],
-                     batch_size=batch_size)
-        loss = sum(loss_dict.values())
-        self.log("val_loss/total", loss, prog_bar=True, batch_size=batch_size)
+    def _compute_mean_ap(self):
+        mean_ap = MeanAveragePrecision(iou_type="segm")
+        results = mean_ap(self.val_preds, self.val_targets)
+        self.mean_ap_values.append(results["map"])
+        self.mean_ap_counts.append(len(self.val_preds))
+        self.val_preds = []
+        self.val_targets = []
 
-    def test_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx):
         images, targets = batch
-        preds = self.model(images)
+        preds = self(images)
         for pred in preds:
             pred["masks"] = pred["masks"].round().to(torch.uint8).squeeze(1)
-        self.test_preds.extend(preds)
-        self.test_targets.extend(targets)
+        self.val_preds.extend(preds)
+        self.val_targets.extend(targets)
+        if len(self.val_preds) >= 50:
+            self._compute_mean_ap()
 
-    def on_test_epoch_end(self):
-        mean_ap = MeanAveragePrecision(iou_type="segm")
-        results = mean_ap(self.test_preds, self.test_targets)
-        self.log("test_mAP", results["map"], )
-        self.tests_preds = []
-        self.test_targets = []
+    def on_validation_epoch_end(self):
+        if len(self.val_preds) > 0:
+            self._compute_mean_ap()
+        weights = np.array(self.mean_ap_counts) / sum(self.mean_ap_counts)
+        mean_ap = (np.array(self.mean_ap_values) * weights).sum()
+        self.log("val_mAP", mean_ap, prog_bar=True)
+        self.mean_ap_values = []
+        self.mean_ap_counts = []
 
 
 if __name__ == "__main__":
