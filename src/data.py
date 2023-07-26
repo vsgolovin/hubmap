@@ -79,8 +79,8 @@ class DetectionDataModule(pl.LightningDataModule):
     def __init__(self, root: Path | str, target_class: str,
                  dataset_ids: list[int], train_transform: Callable,
                  val_transform: Callable, split_seed: int | None = None,
-                 val_size: float = 0.1, batch_size: int = 2,
-                 num_workers: int = 2):
+                 val_size: float = 0.1, val_images: list[str] = [],
+                 batch_size: int = 2, num_workers: int = 2):
         super().__init__()
         self.root = Path(root)
         assert self.root.exists() and self.root.is_dir()
@@ -92,6 +92,7 @@ class DetectionDataModule(pl.LightningDataModule):
         self.val_transform = val_transform
         self.split_seed = split_seed
         self.val_size = val_size
+        self.val_images = val_images
         self.batch_size = batch_size
         self.num_workers = num_workers
 
@@ -117,16 +118,27 @@ class DetectionDataModule(pl.LightningDataModule):
                 self.masks.append(np.array(masks))
 
     def setup(self, stage: str):
-        # stratify by WSI
-        df = pd.read_csv(self.root / "tile_meta.csv").set_index("id")
-        stratify = [df.loc[img_id, "source_wsi"] for img_id in self.images]
         # split data
-        train_idx, val_idx = train_test_split(
-            np.arange(len(self.images)),
-            test_size=self.val_size,
-            random_state=self.split_seed,
-            stratify=stratify
-        )
+        if self.val_images:
+            val_images_set = set(self.val_images)
+            train_idx, val_idx = [], []
+            for i, image_id in enumerate(self.images):
+                if image_id in val_images_set:
+                    val_idx.append(i)
+                else:
+                    train_idx.append(i)
+        else:
+            # stratify by WSI
+            df = pd.read_csv(self.root / "tile_meta.csv").set_index("id")
+            stratify = [df.loc[img_id, "source_wsi"] for img_id in self.images]
+            # no idea why using indices and not the actual list
+            train_idx, val_idx = train_test_split(
+                np.arange(len(self.images)),
+                test_size=self.val_size,
+                random_state=self.split_seed,
+                stratify=stratify
+            )
+        # create datasets
         self.train_dset = DetectionDataset(
             root=self.root / "train",
             images=[self.images[ind] for ind in train_idx],
@@ -347,7 +359,7 @@ class MyDetectionDataset(Dataset):
     def __init__(self, image_dir: Path | str, image_ids: list[str],
                  annotations: pd.DataFrame, annotation_dir: Path | str,
                  transform: Callable,
-                 confidence_threshold: float | None = None,
+                 confidence_threshold: float = 0.0,
                  overlap_threshold: float = 0.9):
         """
         Parameters
@@ -426,7 +438,7 @@ class MyDetectionDataModule(pl.LightningDataModule):
                  train_transform: Callable, val_transform: Callable,
                  split_seed: int | None = None, val_size: float = 0.15,
                  batch_size: int = 2, num_workers: int = 2,
-                 confidence_threshold: float | None = None,
+                 confidence_threshold: float = 0.0,
                  overlap_threshold: float = 0.9):
         super().__init__()
         self.root = Path(root)

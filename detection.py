@@ -108,6 +108,7 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
 @click.option("--ckpt", type=click.Path())
 @click.option("--seed", type=int, default=5511)
 @click.option("--split-seed", type=int, default=4277)
+@click.option("--val-images", type=click.Path(), default="data/val_images.txt")
 @click.option("--bs", "--batch-size", type=int, default=1)
 @click.option("--accumulate-grad-batches", type=int, default=16)
 @click.option("--lr", "--learning-rate", type=float, default=8e-5)
@@ -119,13 +120,20 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
 @click.option("--predictor-hidden-size", type=int, default=256)
 @click.option("--lr-find", is_flag=True, default=False)
 @click.option("-T", "--cosine-annealing-periods", type=int, default=1)
-def finetune(ckpt: str, seed: int, split_seed: int, bs: int,
+def finetune(ckpt: str, seed: int, split_seed: int, val_images: str, bs: int,
              accumulate_grad_batches: int, lr: float, weight_decay: float,
              epochs: int, trainable_bb_layers: int, v2: bool,
              predictor_hidden_size: int, lr_find: bool,
              cosine_annealing_periods: int):
     "Fine-tune pretrained model on dataset 1"
     pl.seed_everything(seed)
+
+    # load validation images ids
+    vi = []
+    if val_images:
+        with open(val_images, "r") as fin:
+            for line in fin:
+                vi.append(line.rstrip())
 
     # load data
     dm = DetectionDataModule(
@@ -135,6 +143,7 @@ def finetune(ckpt: str, seed: int, split_seed: int, bs: int,
         train_transform=get_transform(train=True),
         val_transform=get_transform(train=False),
         split_seed=split_seed,
+        val_images=vi,
         batch_size=bs,
         num_workers=min(bs, 8)
     )
