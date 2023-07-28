@@ -16,7 +16,7 @@ import click
 @click.command(context_settings={"show_default": True})
 @click.argument("weights", type=click.Path())
 @click.option("--input-dir", type=click.Path(), default="./data/hubmap",
-              help="Path to HubMAP dataset")
+              help="Path to HuBMAP dataset")
 @click.option("--output-dir", type=click.Path(), default="./data/annotations",
               help="Directory to save annotations to")
 @click.option("--threshold", default=0.7,
