@@ -4,22 +4,47 @@ from torch import nn, optim, Tensor
 from torch.nn.functional import interpolate
 from torchvision import models
 from torchvision.models import detection
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.models.detection.backbone_utils import _resnet_fpn_extractor
+from torchvision.ops.misc import FrozenBatchNorm2d
 from torchvision.transforms import Normalize
 from torchvision.utils import make_grid
 
 
-def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
-                 num_classes: int = 2, v2: bool = False,
-                 predictor_hidden_size: int = 256) -> detection.FasterRCNN:
-    # load model
-    weights = "DEFAULT" if pretrained else None
-    if v2:
-        constructor = detection.maskrcnn_resnet50_fpn_v2
-    else:
-        constructor = detection.maskrcnn_resnet50_fpn
-    model = constructor(weights=weights, weights_backbone=weights)
+def get_maskrcnn(pretrained: bool = True,
+                 trainable_backbone_layers: int = 3,
+                 num_classes: int = 2) -> detection.MaskRCNN:
+    def child_state_dict(weights, name):
+        sd = weights.get_state_dict(True)
+        return {
+            k[len(name) + 1:]: sd[k]
+            for k in sd if k.startswith(name)
+        }
+
+    if pretrained:
+        weights = models.detection.MaskRCNN_ResNet50_FPN_Weights
+        weights = weights.verify("DEFAULT")
+    backbone = models.resnet50(weights=None, norm_layer=FrozenBatchNorm2d)
+    backbone = _resnet_fpn_extractor(backbone, trainable_layers=5)
+
+    model = detection.MaskRCNN(
+        backbone=backbone,
+        num_classes=num_classes,
+        min_size=1024
+    )
+
+    # load weights
+    if pretrained:
+        model.rpn.load_state_dict(child_state_dict(weights, "rpn"))
+        model.backbone.load_state_dict(child_state_dict(weights, "backbone"))
+        model.roi_heads.box_head.load_state_dict(
+            child_state_dict(weights, "roi_heads.box_head"))
+        model.roi_heads.mask_head.load_state_dict(
+            child_state_dict(weights, "roi_heads.mask_head"))
+
+    # overwrite eps for some reason
+    for module in model.modules():
+        if isinstance(module, FrozenBatchNorm2d):
+            module.eps = 0.0
 
     # freeze backbone layers
     assert 0 <= trainable_backbone_layers <= 5
@@ -29,13 +54,6 @@ def get_maskrcnn(pretrained: bool = True, trainable_backbone_layers: int = 3,
         if not any(name.startswith(prefix) for prefix in layers_to_train):
             parameter.requires_grad_(False)
 
-    # replace heads
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask,
-                                                       predictor_hidden_size,
-                                                       num_classes)
     return model
 
 

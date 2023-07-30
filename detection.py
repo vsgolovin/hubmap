@@ -27,20 +27,17 @@ def cli():
 @click.option("--accumulate-grad-batches", type=int, default=16)
 @click.option("--lr", "--learning-rate", type=float, default=1e-4)
 @click.option("--weight-decay", type=float, default=0.0)
-@click.option("--epochs", type=int, default=10)
+@click.option("--epochs", type=int, default=20)
 @click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
               default=2)
-@click.option("--v2", is_flag=True, default=False)
-@click.option("--predictor-hidden-size", type=int, default=256)
 @click.option("-w", "--backbone-weights", type=str, default="default")
 @click.option("--lr-find", is_flag=True, default=False)
 @click.option("-T", "--cosine-annealing-periods", type=int, default=1)
-@click.option("--confidence-threshold", default=0.9,
+@click.option("--confidence-threshold", default=0.0,
               type=click.FloatRange(0, 1, max_open=True))
 def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
              lr: float, weight_decay: float, epochs: int,
-             trainable_bb_layers: int, v2: bool, predictor_hidden_size: int,
-             backbone_weights: str, lr_find: bool,
+             trainable_bb_layers: int, backbone_weights: str, lr_find: bool,
              cosine_annealing_periods: int, confidence_threshold: float):
     "Train model on dataset 2 and 3 images annotated with previous model"
     pl.seed_everything(seed)
@@ -71,8 +68,6 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
         pretrained=True,
         trainable_backbone_layers=trainable_bb_layers,
         num_classes=2,
-        v2=v2,
-        predictor_hidden_size=predictor_hidden_size
     )
 
     # load pretrained backbone weights
@@ -108,22 +103,19 @@ def pretrain(seed: int, split_seed: int, bs: int, accumulate_grad_batches: int,
 @click.option("--ckpt", type=click.Path())
 @click.option("--seed", type=int, default=5511)
 @click.option("--split-seed", type=int, default=4277)
-@click.option("--val-images", type=click.Path(), default="data/val_images.txt")
+@click.option("--val-images", type=click.Path(),
+              default="data/val_images_ds1.txt")
 @click.option("--bs", "--batch-size", type=int, default=1)
 @click.option("--accumulate-grad-batches", type=int, default=16)
-@click.option("--lr", "--learning-rate", type=float, default=8e-5)
+@click.option("--lr", "--learning-rate", type=float, default=1e-4)
 @click.option("--weight-decay", type=float, default=0.0)
-@click.option("--epochs", type=int, default=12)
-@click.option("--trainable-bb-layers", type=click.IntRange(0, 5),
-              default=3)
-@click.option("--v2", is_flag=True, default=False)
-@click.option("--predictor-hidden-size", type=int, default=256)
+@click.option("--epochs", type=int, default=15)
+@click.option("--trainable-bb-layers", type=click.IntRange(0, 5), default=2)
 @click.option("--lr-find", is_flag=True, default=False)
 @click.option("-T", "--cosine-annealing-periods", type=int, default=1)
 def finetune(ckpt: str, seed: int, split_seed: int, val_images: str, bs: int,
              accumulate_grad_batches: int, lr: float, weight_decay: float,
-             epochs: int, trainable_bb_layers: int, v2: bool,
-             predictor_hidden_size: int, lr_find: bool,
+             epochs: int, trainable_bb_layers: int, lr_find: bool,
              cosine_annealing_periods: int):
     "Fine-tune pretrained model on dataset 1"
     pl.seed_everything(seed)
@@ -162,7 +154,6 @@ def finetune(ckpt: str, seed: int, split_seed: int, val_images: str, bs: int,
             weight_decay=weight_decay,
             ca_steps=ca_steps,
             trainable_backbone_layers=trainable_bb_layers,
-            v2=v2
         )
     else:
         model = LitMaskRCNN(
@@ -172,8 +163,6 @@ def finetune(ckpt: str, seed: int, split_seed: int, val_images: str, bs: int,
             pretrained=True,
             trainable_backbone_layers=trainable_bb_layers,
             num_classes=2,
-            v2=v2,
-            predictor_hidden_size=predictor_hidden_size
         )
 
     # training settings
