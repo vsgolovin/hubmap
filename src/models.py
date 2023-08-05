@@ -28,8 +28,7 @@ def get_maskrcnn(pretrained: bool = True,
 
     model = detection.MaskRCNN(
         backbone=backbone,
-        num_classes=num_classes,
-        min_size=1024
+        num_classes=num_classes
     )
 
     # load weights
